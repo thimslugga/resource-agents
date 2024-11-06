@@ -112,11 +112,16 @@ tools/ocft/README.zh_CN
 tools/ocft/caselib
 tools/ocft/ocft
 
+.venv
 *.cache
 *.upgrade.xml
+.python-version
 py-compile
 ylwrap
-__pycache__
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # BEAM Entries
 *.beam
@@ -130,6 +135,11 @@ logs
 
 # OS and Editor Artifacts
 .DS_Store
+.env
+.idea
+.vscode
+.devcontainer
+.zed
 .bomb
 *.rej
 *.bz2
@@ -151,7 +161,7 @@ GTAGS
 .gres.*
 *.orig
 .gdb_history
-*~ 
+*~
 \#*
 .changes
 pacemaker.tar.gz
