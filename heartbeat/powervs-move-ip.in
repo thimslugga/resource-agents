@@ -26,6 +26,7 @@ import ipaddress
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -57,6 +58,7 @@ RESOURCE_AGENT_OPTIONS = (
     "iflabel",
     "proxy",
     "profile",
+    "atomic",
 )
 
 OCF_RESOURCE_INSTANCE = os.environ.get("OCF_RESOURCE_INSTANCE", RESOURCE_AGENT_NAME)
@@ -66,11 +68,19 @@ CRM_ATTR_REMOTE_ROUTE_STATUS = OCF_RESOURCE_INSTANCE.lower() + "_remote_route_st
 CMD_TIMEOUT = 10
 CIDR_NETMASK = "32"
 IFLABEL_MAX_LEN = 15  # Maximum character limit for interface labels
-REQUESTS_TIMEOUT = 5  # Timeout for requests calls
+REQUESTS_CONNECT_TIMEOUT = 5  # TCP connection timeout (seconds)
+REQUESTS_READ_TIMEOUT = 30  # Read timeout for GET / token calls (seconds)
+REQUESTS_READ_TIMEOUT_WRITE = 60  # Read timeout for PUT / POST route calls (seconds)
+REQUESTS_TIMEOUT = (REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT)
+REQUESTS_TIMEOUT_WRITE = (REQUESTS_CONNECT_TIMEOUT, REQUESTS_READ_TIMEOUT_WRITE)
 HTTP_MAX_RETRIES = 4  # Maximum number of retries for HTTP requests
 HTTP_BACKOFF_FACTOR = 0.3  # Sleep (factor * (2^number of previous retries)) secs
-HTTP_STATUS_FORCE_RETRIES = (500, 502, 503, 504)  # HTTP status codes to retry on
+HTTP_STATUS_FORCE_RETRIES = (429, 500, 502, 503, 504)  # HTTP status codes to retry on
 HTTP_RETRY_ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+ROUTE_POLL_INTERVAL = 5  # seconds between route-state polls
+RESOURCE_AGENT_TIMEOUT_BUFFER = 5  # seconds reserved before the Pacemaker deadline
+IAM_CLOUD_DOMAIN = "iam.cloud.ibm.com"
+POWER_CLOUD_DOMAIN = "power-iaas.cloud.ibm.com"
 
 sys.path.append(OCF_FUNCTIONS_DIR)
 try:
@@ -95,7 +105,7 @@ class CmdError(OCFExitError):
         super().__init__(f"[CmdError] {message}", exit_code)
 
 
-def os_cmd(cmd_args, is_json=False, is_text=False, timeout=10):
+def os_cmd(cmd_args, is_json=False, is_text=False, timeout=CMD_TIMEOUT):
     """Run a system command and optionally parse JSON output or return text.
 
     Returns:
@@ -205,7 +215,7 @@ def crm_attribute_cmd(*args, timeout=CMD_TIMEOUT):
         capture_output=True,
         text=True,
         check=False,
-        timeout=10,
+        timeout=timeout,
         env={"LANG": "C"},
     )
 
@@ -215,8 +225,15 @@ def crm_attribute_set(name, value):
 
     Failure to update the status attribute is fatal because the resource agent
     can no longer reliably track remote-route cleanup state.
+    Outside a Pacemaker cluster CRM_meta_on_node is not set; the call is
+    silently skipped in that case.
     """
     node = ocf.get_parameter("CRM_meta_on_node")
+    if not node:
+        ocf.logger.debug(
+            f"[crm_attribute_set]: CRM_meta_on_node not set, skipping set {name}={value}"
+        )
+        return
     ocf.logger.debug(
         f"[crm_attribute_set]: Setting node attribute {node}:{name}={value}"
     )
@@ -233,11 +250,14 @@ def crm_attribute_get(name):
 
     Returns:
         str: Attribute value when the attribute exists.
-        None: If the attribute is not defined or cannot be queried.
+        None: If the attribute is not defined, cannot be queried, or
+              CRM_meta_on_node is not set (standalone / no cluster).
 
     This helper is best-effort and must never terminate the resource agent.
     """
     node = ocf.get_parameter("CRM_meta_on_node")
+    if not node:
+        return None
     result = crm_attribute_cmd(
         "--node",
         node,
@@ -269,6 +289,8 @@ def crm_attribute_delete(name):
     This helper is best-effort and must never terminate the resource agent.
     """
     node = ocf.get_parameter("CRM_meta_on_node")
+    if not node:
+        return
     ocf.logger.debug(f"[crm_attribute_delete]: Deleting node attribute {node}:{name}")
     crm_attribute_cmd("--node", node, "--name", name, "--delete")
 
@@ -334,7 +356,7 @@ class PowerCloudTokenManager:
     def _get_auth_url(api_type):
         """Determine IAM token endpoint based on API type."""
         iam_subdomain = "private." if api_type == "private" else ""
-        return f"https://{iam_subdomain}iam.cloud.ibm.com/identity/token"
+        return f"https://{iam_subdomain}{IAM_CLOUD_DOMAIN}/identity/token"
 
     def _parse_auth_config(self, api_key, profile):
         """Parse authentication configuration from api_key and profile parameters.
@@ -407,6 +429,12 @@ class PowerCloudTokenManager:
         if not api_key_path.is_file():
             raise PowerCloudTokenManagerError(
                 f"_load_api_key: API key file not found: '{api_key_path}'",
+                ocf.OCF_ERR_ARGS,
+            )
+        mode = stat.S_IMODE(os.stat(api_key_path).st_mode)
+        if mode & 0o077:
+            raise PowerCloudTokenManagerError(
+                f"_load_api_key: API key file '{api_key_path}' has insecure permissions (0{mode:03o}); expected 0600",
                 ocf.OCF_ERR_ARGS,
             )
         content = api_key_path.read_text().strip()
@@ -723,7 +751,7 @@ class PowerCloudAPI:
             )
 
         subdomain = "private." if api_type == "private" else ""
-        return f"https://{subdomain}{region}.power-iaas.cloud.ibm.com"
+        return f"https://{subdomain}{region}.{POWER_CLOUD_DOMAIN}"
 
     def _get_header(self):
         """Construct request header."""
@@ -740,12 +768,16 @@ class PowerCloudAPI:
         ocf.logger.debug(f"[PowerCloudAPI] send_api_request: '{method}' '{resource}'")
 
         try:
+            request_timeout = (
+                REQUESTS_TIMEOUT_WRITE if method in {'PUT', 'POST'}
+                else REQUESTS_TIMEOUT
+            )
             response = self._session.request(
                 method,
                 url,
                 headers=self._header,
                 proxies=self._proxy,
-                timeout=REQUESTS_TIMEOUT,
+                timeout=request_timeout,
                 **kwargs,
             )
             response.raise_for_status()
@@ -785,13 +817,16 @@ class PowerCloudRoute:
         profile="",
         monitor_api="",
         use_token_cache="",
+        atomic="",
         is_remote_route=False,
     ):
         """Initialize PowerCloudRoute instance."""
         self._is_remote_route = is_remote_route
+        self._atomic = ocf.is_true(atomic)
+        self._remote_route_crn = None
         self.ip = self._get_ip_info(ip)
         self.crn, self.route_id = self._parse_route_map(route_host_map)
-        use_cache = str(use_token_cache).lower() == "true"
+        use_cache = ocf.is_true(use_token_cache)
         self._api = PowerCloudAPI(
             api_key=api_key,
             api_type=api_type,
@@ -836,7 +871,13 @@ class PowerCloudRoute:
         return workspace_crn, route_id
 
     def _parse_route_map(self, route_host_map):
-        """Validate the route host map and extract the associated CRN and route ID."""
+        """Validate the route host map and extract the associated CRN and route ID.
+
+        For a local route instance, also stores the remote route's full CRN in
+        self._remote_route_crn so that switch_enabled() can reference it.
+        """
+        # Strip typographic quotes that can appear when the value is copy-pasted.
+        route_host_map = route_host_map.replace('"', "").replace("'", "")
         try:
             route_map = dict(item.split(":", 1) for item in route_host_map.split(";"))
         except ValueError:
@@ -872,6 +913,14 @@ class PowerCloudRoute:
                 f"_parse_route_map: hostname '{nodename}' not found in route_host_map '{route_host_map}'",
                 ocf.OCF_ERR_CONFIGURED,
             )
+
+        # For a local route, store the remote route's full CRN for switch_enabled()
+        if not self._is_remote_route:
+            remote_nodename = next(
+                (host for host in route_map if host != hostname), None
+            )
+            if remote_nodename:
+                self._remote_route_crn = route_map[remote_nodename]
 
         return self._parse_route_crn(route_map[nodename])
 
@@ -949,7 +998,7 @@ class PowerCloudRoute:
         )
 
     def is_enabled(self):
-        """Check whether the PowerVS network route is currently enabled."""
+        """Check whether the PowerVS network route is currently in the deployed state."""
         return self.route_info["state"] == "deployed"
 
     def enable(self):
@@ -961,6 +1010,83 @@ class PowerCloudRoute:
         """Disable the PowerVS network route."""
         if self.is_enabled():
             self._set_route_enabled(False)
+
+    def _refresh_route_info(self):
+        """Re-fetch route info from the API and update self.route_info."""
+        resource = f"/v1/routes/{self.route_id}"
+        self.route_info = self._api.send_api_request("GET", resource)
+
+    def wait_until_deployed(self, deadline):
+        """Poll until the local route reaches the 'deployed' state.
+
+        Args:
+            deadline (float): Absolute monotonic time (seconds) by which the
+                route must be deployed.  The loop stops
+                RESOURCE_AGENT_TIMEOUT_BUFFER seconds before this value so
+                that the caller has time to perform any cleanup before the
+                Pacemaker operation timeout fires.
+
+        Raises:
+            PowerCloudRouteError: If the deadline is reached before the route
+                is deployed.
+        """
+        soft_deadline = deadline - RESOURCE_AGENT_TIMEOUT_BUFFER
+        poll_interval = ROUTE_POLL_INTERVAL * (2 if self._atomic else 1)
+
+        while time.monotonic() < soft_deadline:
+            try:
+                self._refresh_route_info()
+            except (Exception, SystemExit):
+                # A transient API failure should not abort the wait — log and
+                # retry until the deadline is reached.
+                ocf.logger.warning(
+                    f"[PowerCloudRoute] wait_until_deployed: refresh failed; will retry"
+                )
+                time.sleep(poll_interval)
+                continue
+
+            if self.route_info["state"] == "deployed":
+                ocf.logger.debug(
+                    f"[PowerCloudRoute] wait_until_deployed: "
+                    f"local route '{self.route_name}' reached state 'deployed'"
+                )
+                return
+
+            ocf.logger.debug(
+                f"[PowerCloudRoute] wait_until_deployed: "
+                f"waiting for local route '{self.route_name}' "
+                f"(current state: '{self.route_info['state']}')"
+            )
+            time.sleep(poll_interval)
+
+        raise PowerCloudRouteError(
+            f"wait_until_deployed: timed out waiting for local route "
+            f"'{self.route_name}' to reach state 'deployed' "
+            f"(current state: '{self.route_info['state']}')",
+            ocf.OCF_ERR_GENERIC,
+        )
+
+    def switch_enabled(self):
+        """Atomically enable this (local) route and disable the remote route.
+
+        Issues a POST to /v1/routes/{route_id}/switch-enabled with the remote
+        route's full CRN as disabledRouteCRN.  This requires that
+        self._remote_route_crn was populated during _parse_route_map, which is
+        always the case for a local (non-remote) route instance.
+        """
+        if not self._remote_route_crn:
+            raise PowerCloudRouteError(
+                "switch_enabled: remote route CRN is not available",
+                ocf.OCF_ERR_GENERIC,
+            )
+        resource = f"/v1/routes/{self.route_id}/switch-enabled"
+        data = json.dumps({"disabledRouteCRN": self._remote_route_crn})
+        ocf.logger.debug(
+            f"[PowerCloudRoute] switch_enabled: atomically enabling route '{self.route_name}' "
+            f"and disabling remote route CRN '{self._remote_route_crn}'"
+        )
+        response = self._api.send_api_request("POST", resource, data=data)
+        ocf.logger.debug(f"[PowerCloudRoute] switch_enabled: response: '{response}'")
 
 
 def _create_route_instance(
@@ -977,6 +1103,9 @@ def _create_route_instance(
             f"[_create_route_instance]: failed to instantiate {zone} route ({error_info})"
         )
         if catch_exception:
+            # Configuration errors are always fatal regardless of catch_exception
+            if isinstance(e, SystemExit) and e.code == ocf.OCF_ERR_CONFIGURED:
+                raise
             return None
         raise
 
@@ -1054,32 +1183,75 @@ def start_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
     """Assign the service IP.
 
     This function performs the following actions:
     - Adds the specified IP address as an alias to the given network interface or the interface matching the route's next hop.
-    - Disables the remote network route and enables the local network route.
+    - For atomic==True: atomically enables the local route and disables the remote route via switch-enabled.
+    - For atomic==False: disables the remote network route and enables the local network route.
     """
+    start_time = time.monotonic()
+    timeout_ms = int(
+        os.environ.get(
+            "OCF_RESKEY_CRM_meta_timeout", str(RESOURCE_AGENT_TIMEOUT * 1000)
+        )
+    )
+    op_deadline = start_time + timeout_ms / 1000
+
     resource_options = _filter_resource_options(**locals())
 
     ocf.logger.info("[start_action]: enabling overlay IP")
     ocf.logger.debug(f"[start_action]: options: '{resource_options}'")
 
-    # Disable remote route and update node attribute
-    _attempt_remote_route_disable(resource_options)
+    use_atomic = ocf.is_true(atomic)
 
-    # Create local route
-    local_route = _create_route_instance(resource_options)
-    assert local_route is not None
+    if use_atomic:
+        # Atomic path: create local route and call switch_enabled; skip remote route management
+        local_route = _create_route_instance(resource_options)
+        assert local_route is not None
 
-    # Add IP alias
-    ip_alias_add(ip, local_route.device, local_route.iflabel)
+        # Add IP alias
+        ip_alias_add(ip, local_route.device, local_route.iflabel)
 
-    # Enable local route
-    _enable_route(local_route)
+        # Atomically enable local route and disable remote route
+        ocf.logger.debug(
+            f"[start_action]: atomic switch_enabled for local route '{local_route.route_name}'"
+        )
+        try:
+            local_route.switch_enabled()
+            local_route.wait_until_deployed(op_deadline)
+        except Exception:
+            ocf.logger.error(
+                f"[start_action]: failed after switch_enabled; rolling back IP alias '{ip}'"
+            )
+            ip_alias_remove(ip)
+            raise
+    else:
+        # Non-atomic path: disable remote route and enable local route separately
+        # Disable remote route and update node attribute
+        _attempt_remote_route_disable(resource_options)
 
-    # Validate with monitor
+        # Create local route
+        local_route = _create_route_instance(resource_options)
+        assert local_route is not None
+
+        # Add IP alias
+        ip_alias_add(ip, local_route.device, local_route.iflabel)
+
+        # Enable local route and wait until deployed
+        try:
+            _enable_route(local_route)
+            local_route.wait_until_deployed(op_deadline)
+        except Exception:
+            ocf.logger.error(
+                f"[start_action]: failed after enable; rolling back IP alias '{ip}'"
+            )
+            ip_alias_remove(ip)
+            raise
+
+    # Validate with monitor (route is now deployed)
     monitor_result = monitor_action(**resource_options)
     if monitor_result != ocf.OCF_SUCCESS:
         raise PowerCloudRouteError(
@@ -1105,6 +1277,7 @@ def stop_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
     """Remove the service IP.
 
@@ -1157,6 +1330,7 @@ def monitor_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
     """Monitor the service IP and local route state.
 
@@ -1189,15 +1363,18 @@ def monitor_action(
     is_probe = ocf.is_probe()
     is_start_action = ocf.OCF_ACTION == "start"
     use_extended_monitor = is_start_action or (
-        str(monitor_api).lower() == "true" and not is_probe
+        ocf.is_true(monitor_api) and not is_probe
     )
 
     ocf.logger.debug(
         f"[monitor_action]: options: '{resource_options}', is_probe: '{is_probe}'"
     )
 
+    use_atomic = ocf.is_true(atomic)
+
     # Check if remote route disable is needed during regular monitor
-    if not is_probe:
+    # Only applicable for non-atomic mode (atomic mode does not track remote route state)
+    if not is_probe and not use_atomic:
         remote_route_disable_status = crm_attribute_get(CRM_ATTR_REMOTE_ROUTE_STATUS)
         if remote_route_disable_status == "UNKNOWN":
             ocf.logger.debug(
@@ -1218,9 +1395,14 @@ def monitor_action(
 
     # Extended monitor: validate routes and their states
     # Remote-route issues are advisory only and must not trigger restart.
-    remote_route = _create_route_instance(
-        resource_options, is_remote_route=True, catch_exception=True
-    )
+    # Tolerate failures when fetching the remote route state.
+    try:
+        remote_route = _create_route_instance(
+            resource_options, is_remote_route=True, catch_exception=True
+        )
+    except (Exception, SystemExit):
+        remote_route = None
+
     if remote_route is None:
         ocf.logger.warning("[monitor_action]: failed to instantiate remote route")
     else:
@@ -1249,6 +1431,21 @@ def monitor_action(
 
     # At this point the local route is instantiated. Check consistency between
     # the local IP alias state and the local route state.
+    # "updating" is an interim state that can follow either an enable or a disable:
+    # treat it as in-transit and rely on the IP alias to determine the result.
+    local_state = local_route.route_info["state"]
+
+    if local_state == "updating":
+        if ip_alias_present:
+            ocf.logger.debug(
+                f"[monitor_action]: local route '{local_route.route_name}' is updating, IP alias '{ip}' is active"
+            )
+            return ocf.OCF_SUCCESS
+        ocf.logger.debug(
+            f"[monitor_action]: local route '{local_route.route_name}' is updating, IP alias '{ip}' is not active"
+        )
+        return ocf.OCF_NOT_RUNNING
+
     route_enabled = local_route.is_enabled()
 
     if ip_alias_present and route_enabled:
@@ -1286,6 +1483,7 @@ def validate_all_action(
     iflabel="",
     proxy="",
     profile="",
+    atomic="",
 ):
     """Validates the provided resource agent options by attempting to instantiate route objects for both local and remote routes."""
 
@@ -1337,7 +1535,7 @@ def main():
             For detailed guidance on high availability for SAP applications on PowerVS, visit:
             https://cloud.ibm.com/docs/sap?topic=sap-ha-overview.
         """),
-        version=1.1,
+        version=1.2,
     )
 
     agent.add_parameter(
@@ -1474,6 +1672,19 @@ def main():
         required=False,
     )
 
+    agent.add_parameter(
+        "atomic",
+        shortdesc="Atomic update of the route pair",
+        longdesc=(
+            "When set to True, the local route is enabled and the remote route is disabled "
+            "atomically using a single API call (POST /v1/routes/{id}/switch-enabled). "
+            "When set to False (default), the routes are updated individually."
+        ),
+        content_type="string",
+        default="False",
+        required=False,
+    )
+
     agent.add_action("start", timeout=RESOURCE_AGENT_TIMEOUT, handler=start_action)
     agent.add_action("stop", timeout=RESOURCE_AGENT_TIMEOUT, handler=stop_action)
     agent.add_action(
@@ -1492,4 +1703,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
