@@ -1,0 +1,66 @@
+# EditorConfig: https://editorconfig.org
+
+# top-most EditorConfig file
+root = true
+
+# Default settings for all files
+[*]
+charset = utf-8
+end_of_line = lf
+spelling_language = en-US
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.sh]
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+max_line_length = 80
+shell_variant = bash
+
+[Makefile]
+indent_style = tab
+indent_size = 4
+trim_trailing_whitespace = false
+insert_final_newline = false
+
+[*.py]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+max_line_length = 100
+docstring_fill_column = 99
+
+[*.{yaml,yml,yamllint}]
+indent_style = space
+indent_size = 2
+
+[*.{json,jsonc}]
+indent_style = space
+indent_size = 2
+
+[*.xml]
+indent_style = space
+indent_size = 2
+
+[*.toml]
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = false
+max_line_length = 80
+
+[*.{ini,cfg,conf}]
+indent_style = space
+indent_size = 4
+
+[*.md]
+indent_style = space
+indent_size = 2
+insert_final_newline = false
