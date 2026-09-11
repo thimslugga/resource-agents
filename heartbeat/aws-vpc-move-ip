@@ -1,5 +1,6 @@
 #!/bin/sh
-#
+# shellcheck shell=sh
+# vim: set sw=4 sts=4 et tw=80 :
 #
 # OCF resource agent to move an IP address within a VPC in the AWS
 #
@@ -25,11 +26,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write the Free Software Foundation,
 # Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
-#
-
 
 #######################################################################
-# Initialization:
+# Initialization
 
 : ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
 . ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
@@ -64,7 +63,6 @@ OCF_RESKEY_awscli_timeout_default=""
 : ${OCF_RESKEY_lookup_type=${OCF_RESKEY_lookup_type_default}}
 : ${OCF_RESKEY_awscli_timeout=${OCF_RESKEY_awscli_timeout_default}}
 #######################################################################
-
 
 USAGE="usage: $0 {start|stop|status|meta-data}";
 ###############################################################################
@@ -234,22 +232,43 @@ awscli cli-connect-timeout value
 END
 }
 
-
 execute_cmd_as_role(){
 	cmd=$1
 	role=$2
-	output="$($AWSCLI_CMD sts assume-role --role-arn $role --role-session-name AWSCLI-RouteTableUpdate --output=text)"
-	export AWS_ACCESS_KEY_ID="$(echo $output | awk -F" " '$4=="CREDENTIALS" {print $5}')"
-	export AWS_SECRET_ACCESS_KEY="$(echo $output | awk -F" " '$4=="CREDENTIALS" {print $7}')"
-	export AWS_SESSION_TOKEN="$(echo $output | awk -F" " '$4=="CREDENTIALS" {print $8}')"
 
-	#Execute command
+	output="$($AWSCLI_CMD sts assume-role \
+		--role-arn "$role" \
+		--role-session-name AWSCLI-RouteTableUpdate \
+		--query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+		--output text)"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		unset output
+		ocf_log err "Failed to assume role ${role}"
+		return "$rc"
+	fi
+
+	set -- $output
+	if [ "$#" -ne 3 ] || [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
+		unset output
+		ocf_log err "Invalid credentials returned while assuming role: ${role}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	export AWS_ACCESS_KEY_ID="$1"
+	export AWS_SECRET_ACCESS_KEY="$2"
+	export AWS_SESSION_TOKEN="$3"
+	unset output
+
+	# Execute command
 	ocf_log debug "Assumed Role ${role}"
 	ocf_log debug "$($OCF_RESKEY_awscli sts get-caller-identity)"
 	ocf_log debug "executing command: $cmd"
 	response="$($cmd)"
-	unset output AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-	echo $response
+	rc=$?
+	unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+	printf '%s\n' "$response"
+	return "$rc"
 }
 
 ec2ip_set_address_param_compat(){
